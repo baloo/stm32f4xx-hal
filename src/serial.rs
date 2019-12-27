@@ -1,10 +1,39 @@
+use core::cell::RefCell;
 use core::fmt;
 use core::marker::PhantomData;
 use core::ptr;
+use core::task::Poll;
+use core::task::Poll::{Pending, Ready};
+use core::task::Waker;
 
-use embedded_hal::serial;
+use embedded_hal::block;
 use embedded_hal::prelude::*;
-use nb::block;
+use embedded_hal::serial;
+
+use cortex_m::{
+    interrupt::{free, Mutex},
+    peripheral::NVIC,
+};
+
+use crate::stm32::Interrupt;
+
+struct Context {
+    rx_waker: Option<Waker>,
+    tx_waker: Option<Waker>,
+}
+
+impl Default for Context {
+    fn default() -> Self {
+        Self {
+            rx_waker: None,
+            tx_waker: None,
+        }
+    }
+}
+
+pub struct IntrHandler<T> {
+    _usart: PhantomData<T>,
+}
 
 #[cfg(any(
     feature = "stm32f401",
@@ -74,13 +103,19 @@ use crate::stm32::{UART4, UART5};
 ))]
 use crate::stm32::{UART7, UART8};
 
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
+use crate::stm32::{UART10, UART9};
+
 #[cfg(any(
+    feature = "stm32f410",
+    feature = "stm32f411",
+    feature = "stm32f412",
     feature = "stm32f413",
     feature = "stm32f423"
 ))]
-use crate::stm32::{UART9, UART10};
-
-
+use crate::gpio::gpioa::PA15;
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
+use crate::gpio::gpioa::PA8;
 #[cfg(any(
     feature = "stm32f405",
     feature = "stm32f407",
@@ -116,12 +151,7 @@ use crate::gpio::gpioa::{PA0, PA1};
     feature = "stm32f469",
     feature = "stm32f479"
 ))]
-use crate::gpio::gpioa::{PA2, PA3, PA9, PA10};
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
-use crate::gpio::gpioa::{PA8};
+use crate::gpio::gpioa::{PA10, PA2, PA3, PA9};
 #[cfg(any(
     feature = "stm32f401",
     feature = "stm32f410",
@@ -131,14 +161,6 @@ use crate::gpio::gpioa::{PA8};
     feature = "stm32f423"
 ))]
 use crate::gpio::gpioa::{PA11, PA12};
-#[cfg(any(
-    feature = "stm32f410",
-    feature = "stm32f411",
-    feature = "stm32f412",
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
-use crate::gpio::gpioa::{PA15};
 
 #[cfg(any(
     feature = "stm32f410",
@@ -147,17 +169,30 @@ use crate::gpio::gpioa::{PA15};
     feature = "stm32f413",
     feature = "stm32f423"
 ))]
-use crate::gpio::gpiob::{PB3};
+use crate::gpio::gpiob::PB3;
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
+use crate::gpio::gpiob::PB4;
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
+use crate::gpio::gpiob::PB5;
 #[cfg(any(
+    feature = "stm32f405",
+    feature = "stm32f407",
+    feature = "stm32f412",
     feature = "stm32f413",
-    feature = "stm32f423"
+    feature = "stm32f415",
+    feature = "stm32f417",
+    feature = "stm32f423",
+    feature = "stm32f427",
+    feature = "stm32f429",
+    feature = "stm32f437",
+    feature = "stm32f439",
+    feature = "stm32f446",
+    feature = "stm32f469",
+    feature = "stm32f479"
 ))]
-use crate::gpio::gpiob::{PB4};
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
-use crate::gpio::gpiob::{PB5};
+use crate::gpio::gpiob::{PB10, PB11};
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
+use crate::gpio::gpiob::{PB12, PB13};
 #[cfg(any(
     feature = "stm32f401",
     feature = "stm32f405",
@@ -178,11 +213,32 @@ use crate::gpio::gpiob::{PB5};
     feature = "stm32f479"
 ))]
 use crate::gpio::gpiob::{PB6, PB7};
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 use crate::gpio::gpiob::{PB8, PB9};
+
+#[cfg(any(
+    feature = "stm32f405",
+    feature = "stm32f407",
+    feature = "stm32f413",
+    feature = "stm32f415",
+    feature = "stm32f417",
+    feature = "stm32f423",
+    feature = "stm32f427",
+    feature = "stm32f429",
+    feature = "stm32f437",
+    feature = "stm32f439",
+    feature = "stm32f446",
+    feature = "stm32f469",
+    feature = "stm32f479"
+))]
+use crate::gpio::gpioc::PC12;
+#[cfg(any(
+    feature = "stm32f412",
+    feature = "stm32f413",
+    feature = "stm32f423",
+    feature = "stm32f446"
+))]
+use crate::gpio::gpioc::PC5;
 #[cfg(any(
     feature = "stm32f405",
     feature = "stm32f407",
@@ -199,20 +255,7 @@ use crate::gpio::gpiob::{PB8, PB9};
     feature = "stm32f469",
     feature = "stm32f479"
 ))]
-use crate::gpio::gpiob::{PB10, PB11};
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
-use crate::gpio::gpiob::{PB12, PB13};
-
-#[cfg(any(
-    feature = "stm32f412",
-    feature = "stm32f413",
-    feature = "stm32f423",
-    feature = "stm32f446"
-))]
-use crate::gpio::gpioc::{PC5};
+use crate::gpio::gpioc::{PC10, PC11};
 #[cfg(any(
     feature = "stm32f401",
     feature = "stm32f405",
@@ -233,45 +276,9 @@ use crate::gpio::gpioc::{PC5};
     feature = "stm32f479"
 ))]
 use crate::gpio::gpioc::{PC6, PC7};
-#[cfg(any(
-    feature = "stm32f405",
-    feature = "stm32f407",
-    feature = "stm32f412",
-    feature = "stm32f413",
-    feature = "stm32f415",
-    feature = "stm32f417",
-    feature = "stm32f423",
-    feature = "stm32f427",
-    feature = "stm32f429",
-    feature = "stm32f437",
-    feature = "stm32f439",
-    feature = "stm32f446",
-    feature = "stm32f469",
-    feature = "stm32f479"
-))]
-use crate::gpio::gpioc::{PC10, PC11};
-#[cfg(any(
-    feature = "stm32f405",
-    feature = "stm32f407",
-    feature = "stm32f413",
-    feature = "stm32f415",
-    feature = "stm32f417",
-    feature = "stm32f423",
-    feature = "stm32f427",
-    feature = "stm32f429",
-    feature = "stm32f437",
-    feature = "stm32f439",
-    feature = "stm32f446",
-    feature = "stm32f469",
-    feature = "stm32f479"
-))]
-use crate::gpio::gpioc::PC12;
 
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
-use crate::gpio::gpiod::{PD0, PD1};
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
+use crate::gpio::gpiod::PD10;
 #[cfg(any(
     feature = "stm32f405",
     feature = "stm32f407",
@@ -288,6 +295,10 @@ use crate::gpio::gpiod::{PD0, PD1};
     feature = "stm32f479"
 ))]
 use crate::gpio::gpiod::PD2;
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
+use crate::gpio::gpiod::{PD0, PD1};
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
+use crate::gpio::gpiod::{PD14, PD15};
 #[cfg(any(
     feature = "stm32f401",
     feature = "stm32f405",
@@ -324,16 +335,6 @@ use crate::gpio::gpiod::{PD5, PD6};
     feature = "stm32f479"
 ))]
 use crate::gpio::gpiod::{PD8, PD9};
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
-use crate::gpio::gpiod::PD10;
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
-use crate::gpio::gpiod::{PD14, PD15};
 
 #[cfg(any(
     feature = "stm32f413",
@@ -346,10 +347,7 @@ use crate::gpio::gpiod::{PD14, PD15};
     feature = "stm32f479"
 ))]
 use crate::gpio::gpioe::{PE0, PE1};
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 use crate::gpio::gpioe::{PE2, PE3};
 #[cfg(any(
     feature = "stm32f413",
@@ -375,17 +373,13 @@ use crate::gpio::gpioe::{PE7, PE8};
     feature = "stm32f479"
 ))]
 use crate::gpio::gpiof::{PF6, PF7};
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 use crate::gpio::gpiof::{PF8, PF9};
 
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 use crate::gpio::gpiog::{PG0, PG1};
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
+use crate::gpio::gpiog::{PG11, PG12};
 #[cfg(any(
     feature = "stm32f405",
     feature = "stm32f407",
@@ -403,18 +397,10 @@ use crate::gpio::gpiog::{PG0, PG1};
     feature = "stm32f479"
 ))]
 use crate::gpio::gpiog::{PG14, PG9};
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
-use crate::gpio::gpiog::{PG11, PG12};
 
-use crate::gpio::{Alternate, AF7, AF8};
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 use crate::gpio::AF11;
+use crate::gpio::{Alternate, AF7, AF8};
 use crate::rcc::Clocks;
 
 /// Serial error
@@ -536,7 +522,8 @@ impl<USART, TX, RX> Pins<USART> for (TX, RX)
 where
     TX: PinTx<USART>,
     RX: PinRx<USART>,
-{}
+{
+}
 
 /// A filler type for when the Tx pin is unnecessary
 pub struct NoTx;
@@ -1007,15 +994,9 @@ impl PinTx<UART4> for PA0<Alternate<AF8>> {}
     feature = "stm32f479"
 ))]
 impl PinRx<UART4> for PA1<Alternate<AF8>> {}
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinTx<UART4> for PA12<Alternate<AF11>> {}
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinRx<UART4> for PA11<Alternate<AF11>> {}
 #[cfg(any(
     feature = "stm32f405",
@@ -1045,25 +1026,13 @@ impl PinTx<UART4> for PC10<Alternate<AF8>> {}
     feature = "stm32f479"
 ))]
 impl PinRx<UART4> for PC11<Alternate<AF8>> {}
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinTx<UART4> for PD1<Alternate<AF11>> {}
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinRx<UART4> for PD0<Alternate<AF11>> {}
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinTx<UART4> for PD10<Alternate<AF8>> {}
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinRx<UART4> for PC11<Alternate<AF8>> {}
 
 #[cfg(any(
@@ -1098,35 +1067,17 @@ impl PinTx<UART5> for NoTx {}
     feature = "stm32f479"
 ))]
 impl PinRx<UART5> for NoRx {}
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinTx<UART5> for PB6<Alternate<AF11>> {}
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinRx<UART5> for PB5<Alternate<AF11>> {}
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinTx<UART5> for PB9<Alternate<AF11>> {}
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinRx<UART5> for PB8<Alternate<AF11>> {}
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinTx<UART5> for PB13<Alternate<AF11>> {}
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinRx<UART5> for PB12<Alternate<AF11>> {}
 #[cfg(any(
     feature = "stm32f405",
@@ -1160,13 +1111,9 @@ impl PinTx<UART5> for PC12<Alternate<AF8>> {}
     feature = "stm32f479"
 ))]
 impl PinRx<UART5> for PD2<Alternate<AF8>> {}
-#[cfg(any(
-    feature = "stm32f446"
-))]
+#[cfg(any(feature = "stm32f446"))]
 impl PinTx<UART5> for PE8<Alternate<AF8>> {}
-#[cfg(any(
-    feature = "stm32f446"
-))]
+#[cfg(any(feature = "stm32f446"))]
 impl PinRx<UART5> for PE7<Alternate<AF8>> {}
 
 #[cfg(any(
@@ -1324,25 +1271,13 @@ impl PinTx<UART7> for NoTx {}
     feature = "stm32f479"
 ))]
 impl PinRx<UART7> for NoRx {}
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinTx<UART7> for PA15<Alternate<AF8>> {}
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinRx<UART7> for PA8<Alternate<AF8>> {}
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinTx<UART7> for PB4<Alternate<AF8>> {}
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinRx<UART7> for PB3<Alternate<AF8>> {}
 #[cfg(any(
     feature = "stm32f413",
@@ -1433,79 +1368,36 @@ impl PinTx<UART8> for PE1<Alternate<AF8>> {}
     feature = "stm32f479"
 ))]
 impl PinRx<UART8> for PE0<Alternate<AF8>> {}
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinTx<UART8> for PF9<Alternate<AF8>> {}
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinRx<UART8> for PF8<Alternate<AF8>> {}
 
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinTx<UART9> for NoTx {}
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinRx<UART9> for NoRx {}
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinTx<UART9> for PD15<Alternate<AF11>> {}
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinRx<UART9> for PD14<Alternate<AF11>> {}
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinTx<UART9> for PG1<Alternate<AF11>> {}
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinRx<UART9> for PG0<Alternate<AF11>> {}
 
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinTx<UART10> for NoTx {}
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinRx<UART10> for NoRx {}
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinTx<UART10> for PE3<Alternate<AF11>> {}
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinRx<UART10> for PE2<Alternate<AF11>> {}
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinTx<UART10> for PG12<Alternate<AF11>> {}
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 impl PinRx<UART10> for PG11<Alternate<AF11>> {}
-
 
 /// Serial abstraction
 pub struct Serial<USART, PINS> {
@@ -1523,9 +1415,34 @@ pub struct Tx<USART> {
     _usart: PhantomData<USART>,
 }
 
+pub trait Intr {
+    /// Starts listening for an interrupt event
+    fn listen(&mut self, event: Event);
+    /// Stop listening for an interrupt event
+    fn unlisten(&mut self, event: Event);
+    /// Return true if the line idle status is set
+    fn is_idle(&self) -> bool;
+    /// Return true if the tx register is empty (and can accept data)
+    fn is_txe(&self) -> bool;
+    /// Return true if the rx register is not empty (and can be read)
+    fn is_rxne(&self) -> bool;
+}
+
+pub trait IntrStream {
+    /// Starts listening for an interrupt event
+    fn listen(&mut self, waker: Waker);
+    /// Stop listening for an interrupt event
+    fn unlisten(&mut self);
+}
+
+trait IntrStreamCtx {
+    /// Stop listening for an interrupt event with given mutex context
+    fn unlisten_ctx(&mut self, ctx: Option<&mut Context>);
+}
+
 macro_rules! halUsartImpl {
     ($(
-        $USARTX:ident: ($usartX:ident, $apbXenr:ident, $usartXen:ident,  $pclkX:ident),
+        $USARTX:ident: ($usartX:ident, $apbXenr:ident, $usartXen:ident,  $pclkX:ident, $ctxX:ident),
     )+) => {
         $(
             impl<PINS> Serial<$USARTX, PINS> {
@@ -1549,41 +1466,67 @@ macro_rules! halUsartImpl {
                     // Calculate correct baudrate divisor on the fly
                     let div = (clocks.$pclkX().0 + config.baudrate.0 / 2)
                         / config.baudrate.0;
-                    usart.brr.write(|w| unsafe { w.bits(div) });
 
                     // Reset other registers to disable advanced USART features
+                    usart.cr1.reset();
                     usart.cr2.reset();
                     usart.cr3.reset();
 
-                    // Enable transmission and receiving
-                    // and configure frame
                     usart.cr1.write(|w| {
+                        // Enable the port
                         w.ue()
                             .set_bit()
-                            .te()
-                            .set_bit()
-                            .re()
-                            .set_bit()
+                            // configure the word length
                             .m()
                             .bit(match config.wordlength {
                                 WordLength::DataBits8 => false,
                                 WordLength::DataBits9 => true,
-                            }).pce()
+                            })
+                            .pce()
                             .bit(match config.parity {
                                 Parity::ParityNone => false,
                                 _ => true,
-                            }).ps()
+                            })
+                            .ps()
                             .bit(match config.parity {
                                 Parity::ParityOdd => true,
                                 _ => false,
                             })
+                            .te()
+                            .set_bit()
+                            .re()
+                            .set_bit()
                     });
 
-                    Ok(Serial { usart, pins }.config_stop(config))
+                    // configure the stop bits
+                    let port = Serial { usart, pins }.config_stop(config);
+
+                    // set the baud rate
+                    port.usart.brr.write(|w| unsafe { w.bits(div) });
+
+                    // enable interrupt
+                    unsafe { NVIC::unmask(Interrupt::$USARTX)};
+
+                    Ok(port)
                 }
 
-                /// Starts listening for an interrupt event
-                pub fn listen(&mut self, event: Event) {
+                pub fn split(self) -> (Tx<$USARTX>, Rx<$USARTX>) {
+                    (
+                        Tx {
+                            _usart: PhantomData,
+                        },
+                        Rx {
+                            _usart: PhantomData,
+                        },
+                    )
+                }
+
+                pub fn release(self) -> ($USARTX, PINS) {
+                    (self.usart, self.pins)
+                }
+            }
+            impl<PINS> Intr for Serial<$USARTX, PINS> {
+                fn listen(&mut self, event: Event) {
                     match event {
                         Event::Rxne => {
                             self.usart.cr1.modify(|_, w| w.rxneie().set_bit())
@@ -1597,8 +1540,7 @@ macro_rules! halUsartImpl {
                     }
                 }
 
-                /// Stop listening for an interrupt event
-                pub fn unlisten(&mut self, event: Event) {
+                fn unlisten(&mut self, event: Event) {
                     match event {
                         Event::Rxne => {
                             self.usart.cr1.modify(|_, w| w.rxneie().clear_bit())
@@ -1612,40 +1554,23 @@ macro_rules! halUsartImpl {
                     }
                 }
 
-                /// Return true if the line idle status is set
-                pub fn is_idle(& self) -> bool {
+                fn is_idle(& self) -> bool {
                     unsafe { (*$USARTX::ptr()).sr.read().idle().bit_is_set() }
                 }
 
-                /// Return true if the tx register is empty (and can accept data)
-                pub fn is_txe(& self) -> bool {
+                fn is_txe(& self) -> bool {
                     unsafe { (*$USARTX::ptr()).sr.read().txe().bit_is_set() }
                 }
 
-                /// Return true if the rx register is not empty (and can be read)
-                pub fn is_rxne(& self) -> bool {
+                fn is_rxne(& self) -> bool {
                     unsafe { (*$USARTX::ptr()).sr.read().rxne().bit_is_set() }
-                }
-
-                pub fn split(self) -> (Tx<$USARTX>, Rx<$USARTX>) {
-                    (
-                        Tx {
-                            _usart: PhantomData,
-                        },
-                        Rx {
-                            _usart: PhantomData,
-                        },
-                    )
-                }
-                pub fn release(self) -> ($USARTX, PINS) {
-                    (self.usart, self.pins)
                 }
             }
 
             impl<PINS> serial::Read<u8> for Serial<$USARTX, PINS> {
                 type Error = Error;
 
-                fn read(&mut self) -> nb::Result<u8, Error> {
+                fn read(&mut self) -> Poll<Result<u8, Error>> {
                     let mut rx: Rx<$USARTX> = Rx {
                         _usart: PhantomData,
                     };
@@ -1656,7 +1581,7 @@ macro_rules! halUsartImpl {
             impl serial::Read<u8> for Rx<$USARTX> {
                 type Error = Error;
 
-                fn read(&mut self) -> nb::Result<u8, Error> {
+                fn read(&mut self) -> Poll<Result<u8, Error>> {
                     // NOTE(unsafe) atomic read with no side effects
                     let sr = unsafe { (*$USARTX::ptr()).sr.read() };
 
@@ -1669,34 +1594,64 @@ macro_rules! halUsartImpl {
                         unsafe { (*$USARTX::ptr()).dr.read() };
                     }
 
-                    Err(if sr.pe().bit_is_set() {
-                        nb::Error::Other(Error::Parity)
+                    if sr.pe().bit_is_set() {
+                        Ready(Err(Error::Parity))
                     } else if sr.fe().bit_is_set() {
-                        nb::Error::Other(Error::Framing)
+                        Ready(Err(Error::Framing))
                     } else if sr.nf().bit_is_set() {
-                        nb::Error::Other(Error::Noise)
+                        Ready(Err(Error::Noise))
                     } else if sr.ore().bit_is_set() {
-                        nb::Error::Other(Error::Overrun)
+                        Ready(Err(Error::Overrun))
                     } else if sr.rxne().bit_is_set() {
                         // NOTE(read_volatile) see `write_volatile` below
-                        return Ok(unsafe { ptr::read_volatile(&(*$USARTX::ptr()).dr as *const _ as *const _) });
+                        Ready(Ok(unsafe { ptr::read_volatile(&(*$USARTX::ptr()).dr as *const _ as *const _) }))
                     } else {
-                        nb::Error::WouldBlock
+                        Pending
+                    }
+                }
+            }
+
+            impl IntrStream for Rx<$USARTX> {
+                fn listen(&mut self, waker: Waker) {
+                    free(|c| {
+                        unsafe { (*$USARTX::ptr())
+                            .cr1.modify(|_, w| w.rxneie().set_bit()) };
+                        let mut context = $ctxX.borrow(c).borrow_mut();
+                        let context = context.get_or_insert_with(|| Context::default());
+                        context.rx_waker = Some(waker);
                     })
+                }
+
+                fn unlisten(&mut self) {
+                    free(|c| {
+                        let mut context = $ctxX.borrow(c).borrow_mut();
+                        let context = context.as_mut();
+                        self.unlisten_ctx(context);
+                    })
+                }
+            }
+
+            impl IntrStreamCtx for Rx<$USARTX> {
+                fn unlisten_ctx(&mut self, ctx: Option<&mut Context>) {
+                    if let Some(ctx) = ctx {
+                        ctx.rx_waker = None;
+                    }
+                    unsafe { (*$USARTX::ptr())
+                        .cr1.modify(|_, w| w.rxneie().clear_bit())}
                 }
             }
 
             impl<PINS> serial::Write<u8> for Serial<$USARTX, PINS> {
                 type Error = Error;
 
-                fn flush(&mut self) -> nb::Result<(), Self::Error> {
+                fn flush(&mut self) -> Poll<Result<(), Self::Error>> {
                     let mut tx: Tx<$USARTX> = Tx {
                         _usart: PhantomData,
                     };
                     tx.flush()
                 }
 
-                fn write(&mut self, byte: u8) -> nb::Result<(), Self::Error> {
+                fn write(&mut self, byte: u8) -> Poll<Result<(), Self::Error>> {
                     let mut tx: Tx<$USARTX> = Tx {
                         _usart: PhantomData,
                     };
@@ -1707,18 +1662,18 @@ macro_rules! halUsartImpl {
             impl serial::Write<u8> for Tx<$USARTX> {
                 type Error = Error;
 
-                fn flush(&mut self) -> nb::Result<(), Self::Error> {
+                fn flush(&mut self) -> Poll<Result<(), Self::Error>> {
                     // NOTE(unsafe) atomic read with no side effects
                     let sr = unsafe { (*$USARTX::ptr()).sr.read() };
 
                     if sr.tc().bit_is_set() {
-                        Ok(())
+                        Ready(Ok(()))
                     } else {
-                        Err(nb::Error::WouldBlock)
+                        Pending
                     }
                 }
 
-                fn write(&mut self, byte: u8) -> nb::Result<(), Self::Error> {
+                fn write(&mut self, byte: u8) -> Poll<Result<(), Self::Error>> {
                     // NOTE(unsafe) atomic read with no side effects
                     let sr = unsafe { (*$USARTX::ptr()).sr.read() };
 
@@ -1726,19 +1681,87 @@ macro_rules! halUsartImpl {
                         // NOTE(unsafe) atomic write to stateless register
                         // NOTE(write_volatile) 8-bit write that's not possible through the svd2rust API
                         unsafe { ptr::write_volatile(&(*$USARTX::ptr()).dr as *const _ as *mut _, byte) }
-                        Ok(())
+                        Ready(Ok(()))
                     } else {
-                        Err(nb::Error::WouldBlock)
+                        Pending
                     }
                 }
             }
+
+            impl IntrStream for Tx<$USARTX> {
+                fn listen(&mut self, waker: Waker) {
+                    free(|c| {
+                        let mut context = $ctxX.borrow(c).borrow_mut();
+                        let context = context.get_or_insert_with(|| Context::default());
+                        context.tx_waker = Some(waker);
+                        unsafe { (*$USARTX::ptr())
+                            .cr1.modify(|_, w| w.txeie().set_bit().tcie().set_bit()) };
+                    })
+                }
+
+                fn unlisten(&mut self) {
+                    free(|c| {
+                        let mut context = $ctxX.borrow(c).borrow_mut();
+                        let context = context.as_mut();
+                        self.unlisten_ctx(context);
+                    })
+                }
+            }
+
+            impl IntrStreamCtx for Tx<$USARTX> {
+                fn unlisten_ctx(&mut self, ctx: Option<&mut Context>) {
+                    if let Some(ctx) = ctx {
+                        ctx.tx_waker = None;
+                    }
+                    unsafe { (*$USARTX::ptr())
+                        .cr1.modify(|_, w| w.txeie().clear_bit().tcie().clear_bit())}
+                }
+            }
+
+            static $ctxX : Mutex<RefCell<Option<Context>>> =
+                Mutex::new(RefCell::new(None));
+
+            impl IntrHandler<$USARTX> {
+                pub fn interrupt() {
+                    free(|c| {
+                        let mut context = $ctxX.borrow(c).borrow_mut();
+                        if let Some(context) = context.as_mut() {
+                            NVIC::unpend(Interrupt::$USARTX);
+
+                            let sr = unsafe { (*$USARTX::ptr()).sr.read() };
+                            if sr.rxne().bit_is_set() {
+                                let mut rx: Rx<$USARTX> = Rx {
+                                    _usart: PhantomData,
+                                };
+
+                                if let Some(waker) = context.rx_waker.as_ref() {
+                                    waker.wake_by_ref();
+                                }
+                                rx.unlisten_ctx(Some(context));
+                            }
+                            if sr.txe().bit_is_set() {
+                                let mut tx: Tx<$USARTX> = Tx {
+                                    _usart: PhantomData,
+                                };
+
+                                if let Some(waker) = context.tx_waker.as_ref() {
+                                    waker.wake_by_ref();
+                                }
+                                tx.unlisten_ctx(Some(context));
+                            }
+                        }
+                    });
+
+                }
+            }
+
         )+
     }
 }
 
 macro_rules! halUsart {
     ($(
-        $USARTX:ident: ($usartX:ident, $apbXenr:ident, $usartXen:ident, $pclkX:ident),
+        $USARTX:ident: ($usartX:ident, $apbXenr:ident, $usartXen:ident, $pclkX:ident, $ctxX:ident),
     )+) => {
         $(
         impl<PINS> Serial<$USARTX, PINS> {
@@ -1760,7 +1783,7 @@ macro_rules! halUsart {
         )+
 
         halUsartImpl! {
-            $( $USARTX: ($usartX, $apbXenr, $usartXen, $pclkX), )+
+            $( $USARTX: ($usartX, $apbXenr, $usartXen, $pclkX, $ctxX), )+
         }
     }
 }
@@ -1780,7 +1803,7 @@ macro_rules! halUsart {
 ))]
 macro_rules! halUart {
     ($(
-        $USARTX:ident: ($usartX:ident, $apbXenr:ident, $usartXen:ident, $pclkX:ident),
+        $USARTX:ident: ($usartX:ident, $apbXenr:ident, $usartXen:ident, $pclkX:ident, $ctxX:ident),
     )+) => {
         $(
         impl<PINS> Serial<$USARTX, PINS> {
@@ -1802,7 +1825,7 @@ macro_rules! halUart {
         )+
 
         halUsartImpl! {
-            $( $USARTX: ($usartX, $apbXenr, $usartXen, $pclkX), )+
+            $( $USARTX: ($usartX, $apbXenr, $usartXen, $pclkX, $ctxX), )+
         }
     }
 }
@@ -1827,9 +1850,9 @@ macro_rules! halUart {
     feature = "stm32f479"
 ))]
 halUsart! {
-    USART1: (usart1, apb2enr, usart1en, pclk2),
-    USART2: (usart2, apb1enr, usart2en, pclk1),
-    USART6: (usart6, apb2enr, usart6en, pclk2),
+    USART1: (usart1, apb2enr, usart1en, pclk2, CONTEXT_USART1),
+    USART2: (usart2, apb1enr, usart2en, pclk1, CONTEXT_USART2),
+    USART6: (usart6, apb2enr, usart6en, pclk2, CONTEXT_USART6),
 }
 
 #[cfg(any(
@@ -1849,7 +1872,7 @@ halUsart! {
     feature = "stm32f479"
 ))]
 halUsart! {
-    USART3: (usart3, apb1enr, usart3en, pclk1),
+    USART3: (usart3, apb1enr, usart3en, pclk1, CONTEXT_USART3),
 }
 
 #[cfg(any(
@@ -1866,14 +1889,11 @@ halUsart! {
     feature = "stm32f479"
 ))]
 halUart! {
-    UART4: (uart4, apb1enr, uart4en, pclk1),
-    UART5: (uart5, apb1enr, uart5en, pclk1),
+    UART4: (uart4, apb1enr, uart4en, pclk1, CONTEXT_UART4),
+    UART5: (uart5, apb1enr, uart5en, pclk1, CONTEXT_UART5),
 }
 
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 halUsart! {
     UART4: (uart4, apb1enr, uart4en, pclk1),
     UART5: (uart5, apb1enr, uart5en, pclk1),
@@ -1890,14 +1910,11 @@ halUsart! {
     feature = "stm32f479"
 ))]
 halUsart! {
-    UART7: (uart7, apb1enr, uart7en, pclk1),
-    UART8: (uart8, apb1enr, uart8en, pclk1),
+    UART7: (uart7, apb1enr, uart7en, pclk1, CONTEXT_UART7),
+    UART8: (uart8, apb1enr, uart8en, pclk1, CONTEXT_UART8),
 }
 
-#[cfg(any(
-    feature = "stm32f413",
-    feature = "stm32f423"
-))]
+#[cfg(any(feature = "stm32f413", feature = "stm32f423"))]
 halUsart! {
     UART9: (uart9, apb2enr, uart9en, pclk2),
     UART10: (uart10, apb2enr, uart10en, pclk2),
@@ -1908,11 +1925,7 @@ where
     Tx<USART>: serial::Write<u8>,
 {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        let _ = s
-            .as_bytes()
-            .iter()
-            .map(|c| block!(self.write(*c)))
-            .last();
+        let _ = s.as_bytes().iter().map(|c| block!(self.write(*c))).last();
         Ok(())
     }
 }

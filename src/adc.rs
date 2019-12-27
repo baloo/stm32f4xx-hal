@@ -10,7 +10,10 @@
 
 use crate::{gpio::*, signature::VrefCal, signature::VDDA_CALIB, stm32};
 use core::fmt;
+use core::task::Poll;
+use core::task::Poll::Ready;
 use embedded_hal::adc::{Channel, OneShot};
+use embedded_hal::block;
 
 /// Vref internal signal, used for calibration
 pub struct Vref;
@@ -673,7 +676,7 @@ macro_rules! adc {
                     }
 
                     let vref_cal = VrefCal::get().read();
-                    let vref_samp = self.read(&mut Vref).unwrap(); //This can't actually fail, it's just in a result to satisfy hal trait
+                    let vref_samp = block!(self.read(&mut Vref)).unwrap(); //This can't actually fail, it's just in a result to satisfy hal trait
 
                     self.calibrated_vdda = (VDDA_CALIB * u32::from(vref_cal)) / u32::from(vref_samp);
                     if !vref_en {
@@ -984,7 +987,7 @@ macro_rules! adc {
             {
                 type Error = ();
 
-                fn read(&mut self, pin: &mut PIN) -> nb::Result<u16, Self::Error> {
+                fn read(&mut self, pin: &mut PIN) -> Poll<Result<u16, ()>> {
                     let enabled = self.is_enabled();
                     if !enabled {
                         self.enable();
@@ -996,7 +999,7 @@ macro_rules! adc {
                         self.disable();
                     }
 
-                    Ok(sample)
+                    Ready(Ok(sample))
                 }
             }
         )+

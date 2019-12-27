@@ -1,11 +1,12 @@
 //! Timers
 
+use core::task::Poll;
+use core::task::Poll::{Pending, Ready};
+
 use cast::{u16, u32};
 use cortex_m::peripheral::syst::SystClkSource;
 use cortex_m::peripheral::SYST;
 use embedded_hal::timer::{CountDown, Periodic};
-use nb;
-use void::Void;
 
 use crate::stm32::RCC;
 #[cfg(any(
@@ -141,11 +142,11 @@ impl CountDown for Timer<SYST> {
         self.tim.enable_counter();
     }
 
-    fn wait(&mut self) -> nb::Result<(), Void> {
+    fn wait(&mut self) -> Poll<Result<(), !>> {
         if self.tim.has_wrapped() {
-            Ok(())
+            Ready(Ok(()))
         } else {
-            Err(nb::Error::WouldBlock)
+            Pending
         }
     }
 }
@@ -246,12 +247,12 @@ macro_rules! hal {
                     self.tim.cr1.modify(|_, w| w.cen().set_bit());
                 }
 
-                fn wait(&mut self) -> nb::Result<(), Void> {
+                fn wait(&mut self) -> Poll<Result<(), !>> {
                     if self.tim.sr.read().uif().bit_is_clear() {
-                        Err(nb::Error::WouldBlock)
+                        Pending
                     } else {
                         self.tim.sr.modify(|_, w| w.uif().clear_bit());
-                        Ok(())
+                        Ready(Ok(()))
                     }
                 }
             }
